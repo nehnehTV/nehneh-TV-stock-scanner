@@ -87,6 +87,33 @@ Note: while the dashboard tab is open, it auto-refreshes on its own
 timer, so you don't need the terminal version running at the same time
 unless you specifically want the plain log file too.
 
+## Paper trading (simulated balance & P&L)
+
+The dashboard now runs a simulated account alongside the scanner:
+
+- When a signal fires, it "opens" a simulated position at that price.
+- Positions close automatically on a **stop-loss**, a **take-profit**,
+  a **trend-flip** (the 15m bias no longer supports the position), or
+  an **opposite signal** (reversal).
+- Balance, total P&L, win rate, and an equity curve are shown at the
+  top of the dashboard, all computed from these simulated trades —
+  nothing is invented for looks.
+- Position size, stop-loss %, and take-profit % are adjustable in the
+  sidebar. A "Reset paper account" button (behind a confirmation
+  checkbox) wipes the simulated history and starts fresh.
+- State is stored in `paper_trades.json`, so it survives restarts.
+
+**This places no real orders and involves no real money.** It also
+isn't a guarantee — the simulation ignores real-world slippage, fees,
+partial fills, and liquidity, so live results with an actual broker
+would differ. Treat it as a sanity check on the scanner's logic, not
+proof the strategy is profitable.
+
+## Cosmetic agent avatars
+
+Each ticker card now has a small colored shape-avatar (matching its
+callsign) purely for visual flavor — no functional effect.
+
 ## Custom levels: leash top/bottom, river, GEX
 
 Each ticker card in the dashboard now has an "Edit levels" section where
