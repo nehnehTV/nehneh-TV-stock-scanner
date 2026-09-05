@@ -129,12 +129,12 @@ section[data-testid="stExpander"] {
 """, unsafe_allow_html=True)
 
 # ============================================================
-# Agent identity pool (cosmetic callsigns + avatar shapes)
+# Agent identity pool (space-robot callsigns + avatar shapes)
 # ============================================================
 
-CODENAMES = ["VESKA", "NORO", "LUMEN", "TIDAL", "ZEPHR", "RUNE", "OKAPI", "MARIN",
-             "DRIFT", "ASHEN", "COBALT", "QUILL"]
-ROLES = ["TREND", "MOMENTUM", "GAMMA", "TAPE", "TRIGGER", "RISK", "VWAP", "FLOW"]
+CODENAMES = ["BLIP-9", "KLONK-3", "ZORP-X", "WHIRR-7", "BOOP-Q", "CLANK-5",
+             "PING-2", "TIN-8", "GEAR-Z", "SPROK-4", "BEEP-11", "RUST-Y"]
+ROLES = ["SCOUT", "NAV", "RADAR", "PULSE", "VECTOR", "ORBIT", "BOOST", "WARP"]
 AVATAR_STYLES = [
     ("#4da3ff", "circle"), ("#ff3b5c", "triangle"), ("#ffb020", "hex"),
     ("#00ffa3", "circle"), ("#b56bff", "triangle"), ("#ff7edb", "hex"),
@@ -151,17 +151,18 @@ def agent_identity(index: int):
 
 
 def avatar_svg(color: str, shape: str, size: int = 26) -> str:
-    """A small cute-blob avatar: colored shape + two dot eyes."""
+    """A small beep-boop robot avatar: colored shape body, antenna, two dot eyes."""
+    antenna = f'<line x1="16" y1="1" x2="16" y2="6" stroke="{color}" stroke-width="2"/><circle cx="16" cy="1" r="1.6" fill="{color}"/>'
     if shape == "triangle":
-        body = f'<polygon points="16,3 29,27 3,27" fill="{color}" />'
-        eyes = '<circle cx="12.5" cy="20" r="1.8" fill="#0a0e14"/><circle cx="19.5" cy="20" r="1.8" fill="#0a0e14"/>'
+        body = f'<polygon points="16,7 29,27 3,27" fill="{color}" />'
+        eyes = '<circle cx="12.5" cy="21" r="1.8" fill="#0a0e14"/><circle cx="19.5" cy="21" r="1.8" fill="#0a0e14"/>'
     elif shape == "hex":
-        body = f'<polygon points="16,2 28,9 28,23 16,30 4,23 4,9" fill="{color}" />'
-        eyes = '<circle cx="12" cy="16" r="1.8" fill="#0a0e14"/><circle cx="20" cy="16" r="1.8" fill="#0a0e14"/>'
+        body = f'<polygon points="16,6 28,12 28,24 16,30 4,24 4,12" fill="{color}" />'
+        eyes = '<circle cx="12" cy="18" r="1.8" fill="#0a0e14"/><circle cx="20" cy="18" r="1.8" fill="#0a0e14"/>'
     else:
-        body = f'<circle cx="16" cy="16" r="14" fill="{color}" />'
-        eyes = '<circle cx="12" cy="15" r="1.8" fill="#0a0e14"/><circle cx="20" cy="15" r="1.8" fill="#0a0e14"/>'
-    return f'<svg width="{size}" height="{size}" viewBox="0 0 32 32">{body}{eyes}</svg>'
+        body = f'<rect x="4" y="8" width="24" height="22" rx="7" fill="{color}" />'
+        eyes = '<circle cx="12" cy="18" r="1.8" fill="#0a0e14"/><circle cx="20" cy="18" r="1.8" fill="#0a0e14"/>'
+    return f'<svg width="{size}" height="{size}" viewBox="0 0 32 32">{antenna}{body}{eyes}</svg>'
 
 
 # ============================================================
@@ -263,15 +264,12 @@ with hcol1:
 with hcol2:
     dot_class = "on" if market_open else "off"
     status_word = "LIVE" if market_open else "CLOSED"
-    st.markdown(
-        f"""
-        <div class="hdr-meta">
-            <span class="live-dot {dot_class}"></span><b>{status_word}</b> &middot; {now_et.strftime('%I:%M:%S %p %Z')}<br>
-            CYCLE <b>{cycle}</b> &middot; UPTIME <b>{uptime_str}</b> &middot; GRIP <b>SIMULATED</b>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    hdr_meta_html = (
+        f'<div class="hdr-meta">'
+        f'<span class="live-dot {dot_class}"></span><b>{status_word}</b> &middot; {now_et.strftime("%I:%M:%S %p %Z")}<br>'
+        f'CYCLE <b>{cycle}</b> &middot; UPTIME <b>{uptime_str}</b> &middot; GRIP <b>SIMULATED</b></div>'
     )
+    st.markdown(hdr_meta_html, unsafe_allow_html=True)
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -317,21 +315,6 @@ def render_levels_editor(ticker: str, levels: dict):
             st.caption(" | ".join(shown))
 
 
-def build_sparkline(closes) -> str:
-    closes = list(closes)[-20:]
-    if len(closes) < 2:
-        return ""
-    lo, hi = min(closes), max(closes)
-    span = (hi - lo) or 1.0
-    bars = []
-    for i, c in enumerate(closes):
-        height = max(10, round((c - lo) / span * 100))
-        prev = closes[i - 1] if i > 0 else c
-        color = "#00ffa3" if c >= prev else "#ff3b5c"
-        bars.append(f'<div class="spark-bar" style="height:{height}%;background:{color};"></div>')
-    return f'<div class="spark-row">{"".join(bars)}</div>'
-
-
 def scan_ticker(ticker: str) -> dict:
     bias = core.get_trend_bias(ticker)
     direction, bar_ts = (None, None)
@@ -351,7 +334,9 @@ def scan_ticker(ticker: str) -> dict:
     try:
         fast_info = core.yf.Ticker(ticker).fast_info
         prev_close = fast_info.get("previous_close") or fast_info.get("regularMarketPreviousClose")
-        if prev_close:
+        # guard against NaN as well as None -- yfinance sometimes returns
+        # a NaN float (which is truthy) instead of leaving the field absent
+        if prev_close is not None and pd.notna(prev_close) and prev_close > 0:
             pct_change = (price - prev_close) / prev_close * 100
     except Exception:
         pass
@@ -366,7 +351,7 @@ def scan_ticker(ticker: str) -> dict:
         "bar_ts": bar_ts,
         "price": price,
         "pct_change": pct_change,
-        "sparkline": build_sparkline(df5["Close"]),
+        "chart_df": df5[["Close"]].tail(60),
         "gex": gex,
         "levels": levels,
     }
@@ -425,46 +410,46 @@ def render_agent_card(index: int, ticker: str):
             pct_class = "up" if pct >= 0 else "down"
             pct_html = f'<span class="agent-pct {pct_class}">{pct:+.2f}%</span>'
 
-        action_html = f'<div class="agent-action">PAPER: {paper_action}</div>' if paper_action else ""
-
-        st.markdown(
-            f"""
-            <div class="agent-card {card_class}">
-                <div class="agent-header">
-                    {avatar}
-                    <span class="agent-codename">{codename}</span>
-                    <span class="agent-role">{role}</span>
-                    {position_tag}
-                </div>
-                <div class="agent-ticker">{ticker}</div>
-                {data['sparkline']}
-                <div class="agent-footer">
-                    <span class="agent-status {status_class}">{status_text}</span>
-                    {pct_html}
-                </div>
-                <div class="agent-meta">Price <b>${data['price']:,.2f}</b></div>
-                {action_html}
-            </div>
-            """,
-            unsafe_allow_html=True,
+        # NOTE: every HTML fragment below is built as a single line (or joined
+        # with explicit \n only where needed) with NO leading indentation --
+        # markdown treats 4+ leading spaces as a literal code block, which is
+        # what previously caused raw "</div>" tags to show up on the page.
+        header_html = (
+            f'<div class="agent-card {card_class}">'
+            f'<div class="agent-header">{avatar}'
+            f'<span class="agent-codename">{codename}</span>'
+            f'<span class="agent-role">{role}</span>'
+            f'{position_tag}</div>'
+            f'<div class="agent-ticker">{ticker}</div></div>'
         )
+        st.markdown(header_html, unsafe_allow_html=True)
+
+        chart_color = "#00ffa3" if (pct is None or pct >= 0) else "#ff3b5c"
+        st.line_chart(data["chart_df"]["Close"], height=110, color=chart_color)
+
+        action_html = f'<div class="agent-action">PAPER: {paper_action}</div>' if paper_action else ""
+        footer_html = (
+            '<div class="agent-card" style="margin-top:-14px;border-top:none;border-top-left-radius:0;border-top-right-radius:0;">'
+            f'<div class="agent-footer"><span class="agent-status {status_class}">{status_text}</span>{pct_html}</div>'
+            f'<div class="agent-meta">Price <b>${data["price"]:,.2f}</b></div>'
+            f'{action_html}</div>'
+        )
+        st.markdown(footer_html, unsafe_allow_html=True)
+
         if data["gex"]["expiry"]:
             st.caption(f"GEX approx. from {data['gex']['expiry']} chain -- not a paid dealer feed.")
         render_levels_editor(ticker, data["levels"])
 
     except Exception as e:
-        st.markdown(
-            f"""
-            <div class="agent-card">
-                <div class="agent-header">{avatar}<span class="agent-codename">{codename}</span>
-                <span class="agent-role">{role}</span></div>
-                <div class="agent-ticker">{ticker}</div>
-                <div class="agent-status mixed">DATA ERROR</div>
-                <div class="agent-meta">{e}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        error_html = (
+            f'<div class="agent-card"><div class="agent-header">{avatar}'
+            f'<span class="agent-codename">{codename}</span>'
+            f'<span class="agent-role">{role}</span></div>'
+            f'<div class="agent-ticker">{ticker}</div>'
+            '<div class="agent-status mixed">DATA ERROR</div>'
+            f'<div class="agent-meta">{e}</div></div>'
         )
+        st.markdown(error_html, unsafe_allow_html=True)
 
 
 # ============================================================
