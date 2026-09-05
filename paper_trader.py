@@ -1,17 +1,18 @@
 """
-Paper-trading simulator layered on top of the scanner's signals.
+Paper-trading simulator for the daily trend-following strategy.
 
-Opens a SIMULATED position when a confirmed signal fires, and closes it
-on a stop-loss, a take-profit, a trend-bias flip, or an opposite signal
-(reversal). Tracks a virtual cash balance and an equity curve so the
-dashboard can show an honest "what if I took every signal" balance
-chart.
+Opens a SIMULATED position on a confirmed Donchian breakout, sized by
+volatility (ATR) rather than a fixed dollar amount, and closes it on
+either of two independent exits:
+  - a Donchian channel exit (opposite side of the shorter exit channel
+    -- lets winners run with the trend)
+  - an ATR hard stop (caps the worst case on any single trade)
 
 IMPORTANT: this places no real orders and involves no real money. A
 simulated result also isn't a guarantee -- it ignores real-world
 slippage, fees, partial fills, and liquidity, so live results with
 real money would differ. Treat it as a way to sanity-check the
-scanner's logic, not as proof the strategy will make money.
+strategy's logic, not as proof it will make money.
 
 Persisted to paper_trades.json in the project folder so the account
 survives dashboard restarts.
@@ -24,16 +25,15 @@ STATE_FILE = "paper_trades.json"
 
 DEFAULT_SETTINGS = {
     "starting_balance": 10000.0,
-    "position_notional": 1000.0,  # $ notional per simulated trade
-    "stop_loss_pct": 0.015,       # 1.5%
-    "take_profit_pct": 0.03,      # 3%
+    "risk_per_trade_pct": 0.01,   # risk ~1% of equity per trade
+    "atr_stop_multiplier": 2.0,   # hard stop distance = this many ATRs from entry
 }
 
 
 def _default_state():
     return {
         "cash": DEFAULT_SETTINGS["starting_balance"],
-        "positions": {},       # ticker -> {direction, entry_price, shares, opened_at}
+        "positions": {},       # ticker -> {direction, entry_price, shares, hard_stop, opened_at}
         "closed_trades": [],   # list of dicts, most recent first
         "equity_curve": [],    # list of [timestamp_iso, equity]
         "settings": dict(DEFAULT_SETTINGS),
@@ -85,14 +85,22 @@ def _position_pnl(position: dict, current_price: float) -> float:
     return diff * position["shares"]
 
 
-def open_position(state: dict, ticker: str, direction: str, price: float, timestamp: str):
+def open_position(state: dict, ticker: str, direction: str, price: float, atr: float, timestamp: str):
     if ticker in state["positions"]:
         return
-    notional = state["settings"]["position_notional"]
+    if atr is None or atr <= 0:
+        return  # can't size or set a stop safely without a valid ATR
+    settings = state["settings"]
+    equity = state["cash"]  # simplification: sizing off cash, not full mark-to-market equity
+    stop_distance = settings["atr_stop_multiplier"] * atr
+    dollar_risk = equity * settings["risk_per_trade_pct"]
+    shares = dollar_risk / stop_distance
+    hard_stop = price - stop_distance if direction == "long" else price + stop_distance
     state["positions"][ticker] = {
         "direction": direction,
         "entry_price": price,
-        "shares": notional / price,
+        "shares": shares,
+        "hard_stop": hard_stop,
         "opened_at": timestamp,
     }
 
@@ -116,53 +124,46 @@ def close_position(state: dict, ticker: str, price: float, timestamp: str, reaso
     state["closed_trades"] = state["closed_trades"][:200]
 
 
-def _check_stop_take(state: dict, position: dict, current_price: float):
-    settings = state["settings"]
-    pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
-    if position["direction"] == "short":
-        pnl_pct = -pnl_pct
-    if pnl_pct <= -settings["stop_loss_pct"]:
-        return "stop-loss"
-    if pnl_pct >= settings["take_profit_pct"]:
-        return "take-profit"
-    return None
-
-
-def apply_signal(state: dict, ticker: str, bias: str, direction, is_new_signal: bool,
-                  price: float, timestamp: str) -> str:
+def apply_breakout_signal(state: dict, ticker: str, direction, is_new_signal: bool, price: float,
+                           atr, exit_high, exit_low, timestamp: str) -> str:
     """
-    Mutates state in place based on this cycle's scan result for one
-    ticker. direction is 'long'/'short' if a confirmed signal fired
-    this cycle, else None. Returns a short human-readable description
-    of any action taken, or None if nothing changed.
+    Mutates state in place based on this bar's analysis for one ticker.
+    direction is 'long'/'short' if a confirmed breakout fired this bar,
+    else None. exit_high/exit_low are the shorter Donchian channel's
+    current levels (may be None/NaN early in a series). Returns a short
+    human-readable description of any action taken, or None.
     """
     pos = state["positions"].get(ticker)
     action_msgs = []
 
-    # 1) Protective exits run every cycle, independent of new signals.
     if pos:
-        reason = _check_stop_take(state, pos, price)
-        if reason:
+        hit_hard_stop = (
+            (pos["direction"] == "long" and price <= pos["hard_stop"]) or
+            (pos["direction"] == "short" and price >= pos["hard_stop"])
+        )
+        if hit_hard_stop:
             direction_word = pos["direction"].upper()
-            close_position(state, ticker, price, timestamp, reason)
-            action_msgs.append(f"Closed {direction_word} ({reason}) @ {price:.2f}")
-        elif (pos["direction"] == "long" and bias != "bull") or (pos["direction"] == "short" and bias != "bear"):
-            direction_word = pos["direction"].upper()
-            close_position(state, ticker, price, timestamp, "trend-flip")
-            action_msgs.append(f"Closed {direction_word} (trend-flip) @ {price:.2f}")
+            close_position(state, ticker, price, timestamp, "atr-stop")
+            action_msgs.append(f"Closed {direction_word} (atr-stop) @ {price:.4f}")
+        else:
+            hit_channel_exit = (
+                (pos["direction"] == "long" and exit_low is not None and price < exit_low) or
+                (pos["direction"] == "short" and exit_high is not None and price > exit_high)
+            )
+            if hit_channel_exit:
+                direction_word = pos["direction"].upper()
+                close_position(state, ticker, price, timestamp, "channel-exit")
+                action_msgs.append(f"Closed {direction_word} (channel-exit) @ {price:.4f}")
 
-    # 2) Handle a freshly confirmed signal this cycle (may follow a
-    # protective exit above, e.g. stop-loss immediately followed by a
-    # fresh signal in the new direction -- both can happen in one cycle).
     if is_new_signal and direction:
         pos = state["positions"].get(ticker)  # re-check: may have just closed above
         if pos and pos["direction"] != direction:
             close_position(state, ticker, price, timestamp, "reversal")
-            open_position(state, ticker, direction, price, timestamp)
-            action_msgs.append(f"Reversed to {direction.upper()} @ {price:.2f}")
+            open_position(state, ticker, direction, price, atr, timestamp)
+            action_msgs.append(f"Reversed to {direction.upper()} @ {price:.4f}")
         elif not pos:
-            open_position(state, ticker, direction, price, timestamp)
-            action_msgs.append(f"Opened {direction.upper()} @ {price:.2f}")
+            open_position(state, ticker, direction, price, atr, timestamp)
+            action_msgs.append(f"Opened {direction.upper()} @ {price:.4f}")
 
     return " then ".join(action_msgs) if action_msgs else None
 

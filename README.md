@@ -1,26 +1,62 @@
-# Stock Setup Scanner
+# Trend-Following Scanner
 
-Watches your watchlist during market hours and alerts you when a ticker
-meets your setup. Scanner only — no trading yet (that's phase 2).
+Watches your watchlist and alerts you when a ticker breaks out of a
+trend-following setup on the daily chart. Scanner + paper trading only
+— no real trades placed (that's a future phase).
+
+**This replaced an earlier 5m/15m MA-crossover + MACD/RSI setup**,
+which whipsawed constantly in choppy markets even after several rounds
+of chop filters. The problems were structural: short timeframes have
+poor signal-to-noise ratio, and stacking many independent filters
+together turned out to reduce signal count more than expected (see
+git history / prior conversation for the debugging that led here).
+This strategy trades those problems for a different, more
+well-established one: it's slower, produces far fewer signals, and can
+have long stretches with no trades while waiting for a real trend.
 
 ## The logic
 
-**Trend filter (15-min chart):**
-- Price above 200 MA *and* above VWAP → bullish regime
-- Price below 200 MA *and* below VWAP → bearish regime
-- Anything mixed → ignored, no trade
+**Trend filter (daily chart):**
+- Close above the 200-day MA → bull regime, only take longs
+- Close below the 200-day MA → bear regime, only take shorts
 
-**Trigger (5-min chart):**
-- 5 MA crosses above 10 MA → long trigger
-- 5 MA crosses below 10 MA → short trigger
+**Entry — Donchian breakout:**
+- Close breaks above the highest high of the last 20 days, in a bull
+  regime → long
+- Close breaks below the lowest low of the last 20 days, in a bear
+  regime → short
 
-**Confirmation (5-min chart), must match the trigger direction:**
-- MACD line above/below its signal line
-- RSI(14) above/below 50
+**Position sizing — volatility-adjusted, not a fixed dollar amount:**
+- `shares = (equity x risk_per_trade_pct) / (ATR_stop_multiplier x ATR)`
+- A stop-out loses roughly the same % of equity regardless of how
+  volatile the instrument is, instead of a flat dollar amount ignoring
+  volatility.
 
-A signal only fires when trend + trigger + both confirmations line up,
-and each bar only fires once per ticker so you're not spammed every
-minute.
+**Exit — two independent triggers, whichever comes first:**
+- **Channel exit:** close breaks the opposite side of a *shorter*
+  10-day channel. This is what lets winners run — the exit channel
+  trails behind the trend rather than firing on the first pullback.
+- **ATR hard stop:** price moves 2x ATR against entry. This caps the
+  worst case on any single trade if the channel exit is too slow
+  (e.g. a gap move).
+
+This is a simplified version of the classic Turtle Trading system —
+public, well-documented, deliberately simple (few rules is a feature,
+not a limitation — every added rule is a chance to overfit).
+
+**Known, tested limitations, not hidden:**
+- It still occasionally produces a false signal in genuine chop (tested
+  at roughly 2% of days in realistic mean-reverting synthetic data) —
+  just far less often than the old fast-crossover system, not "never."
+- A trend-following system needs actual trends to work. A backtest
+  window with no real trends will show few or losing trades, and
+  that's expected, not necessarily a bug in the strategy.
+- For stocks, a daily bar is *provisional* until market close — a
+  mid-day check shows where things currently stand, not a settled
+  signal.
+- Diversification matters for this style of strategy, and the default
+  crypto watchlist (BTC/ETH/SOL/XRP/DOGE) is less diversified than it
+  looks — most alts move with BTC most of the time.
 
 ## Setup
 
@@ -38,9 +74,10 @@ minute.
 python stock_scanner.py
 ```
 
-Leave the window open. It checks every 60 seconds (configurable via
-`POLL_INTERVAL_SECONDS`), only during 9:30am–4:00pm ET, Monday–Friday.
-When a setup fires you'll get:
+Leave the window open. Daily bars only change once a day, so the
+default poll interval is hourly (`POLL_INTERVAL_SECONDS`, adjustable);
+checking more often just re-confirms the same still-forming bar. When
+a breakout fires you'll get:
 - A line printed in the terminal
 - A line written to `scanner_log_YYYYMMDD.txt` in this folder
 - A desktop popup notification (if `plyer` is installed and your OS
@@ -50,17 +87,16 @@ Stop it any time with `Ctrl+C`.
 
 ## Things worth knowing
 
-- **Data is yfinance (free), typically ~15–20 minutes delayed.** Fine
-  for spotting setups, not fine for split-second entries. Treat every
-  alert as "go check the real chart," not "the trade already happened."
-- **Weekends/holidays:** the script checks weekday + time only — it
-  doesn't know about market holidays, so it'll try to scan and just get
-  empty/stale data on holidays. Not harmful, just noisy in the log.
-- **First run each day** may take a few extra seconds while it pulls
-  15-min history for the 200 MA.
-- **Tuning:** all the knobs (MA periods, RSI midline, timeframes,
-  lookback windows, poll interval) are in the CONFIG section at the top
-  of `stock_scanner.py`.
+- **Data is yfinance (free).** Daily history isn't capped the way
+  intraday data is, but `DAILY_LOOKBACK` (2 years by default) still
+  limits how far back the strategy looks — increase it in
+  `stock_scanner.py` for a longer effective backtest/warmup window.
+- **Weekends/holidays:** for stocks, the script checks weekday + time
+  only — it doesn't know about market holidays, so it'll try to scan
+  and just get stale data on holidays. Not harmful, just a no-op.
+- **Tuning:** all the knobs (trend MA period, entry/exit channel
+  lengths, ATR period/multiplier, risk per trade) are in the CONFIG
+  section at the top of `stock_scanner.py`.
 
 ## Dashboard (nicer UI)
 
@@ -114,25 +150,31 @@ switch back automatically).
 
 ## Paper trading (simulated balance & P&L)
 
-The dashboard now runs a simulated account alongside the scanner:
+The dashboard runs a simulated account alongside the scanner:
 
-- When a signal fires, it "opens" a simulated position at that price.
-- Positions close automatically on a **stop-loss**, a **take-profit**,
-  a **trend-flip** (the 15m bias no longer supports the position), or
-  an **opposite signal** (reversal).
+- When a breakout fires, it "opens" a simulated position sized off
+  ATR and your risk-per-trade % (see the strategy logic above).
+- Positions close automatically on a **Donchian channel exit** (lets
+  winners run) or an **ATR hard stop** (caps the worst case), or an
+  **opposite breakout** (reversal).
 - Balance, total P&L, win rate, and an equity curve are shown at the
   top of the dashboard, all computed from these simulated trades —
   nothing is invented for looks.
-- Position size, stop-loss %, and take-profit % are adjustable in the
+- Risk per trade % and ATR stop multiplier are adjustable in the
   sidebar. A "Reset paper account" button (behind a confirmation
   checkbox) wipes the simulated history and starts fresh.
 - State is stored in `paper_trades.json`, so it survives restarts.
+  **If you're switching from the old MA-crossover strategy, reset the
+  paper account** — old trades in there belong to a different, now
+  removed, strategy and will skew the numbers if left in.
 
 **This places no real orders and involves no real money.** It also
 isn't a guarantee — the simulation ignores real-world slippage, fees,
 partial fills, and liquidity, so live results with an actual broker
-would differ. Treat it as a sanity check on the scanner's logic, not
-proof the strategy is profitable.
+would differ. Treat it as a sanity check on the strategy's logic, not
+proof it's profitable. Trend-following in particular needs a real
+trend to show a real trade; a quiet backtest window isn't necessarily
+a broken strategy.
 
 ## Cosmetic agent avatars
 
@@ -168,72 +210,45 @@ show up on the card and in the signal log but don't yet gate whether a
 signal fires. Say the word if you want them wired into the trigger
 logic (e.g., "only long if price is above the river").
 
-## Chop filters (reducing false signals)
+## Prior strategy (removed)
 
-The original trigger logic (raw MA5/MA10 crossover) whipsawed badly in
-sideways markets -- a crossover by a hair's width counted the same as
-a real move. Five filters were added to `get_trigger_signal` /
-`get_trend_bias` in `stock_scanner.py` to address that:
-
-- **ADX floor + rising** -- ADX (a standard trend-strength measure)
-  must be above a modest floor (`ADX_FLOOR = 8`) AND higher than it
-  was `ADX_RISING_LOOKBACK` (5) bars ago. Earlier version of this
-  required ADX above a high static threshold (20) at the exact bar a
-  cross confirmed -- backtesting showed that eliminated ~95% of
-  otherwise-valid signals, because ADX is a lagging/smoothed
-  indicator that hasn't caught up yet right when a fresh cross
-  happens. The floor+rising version fixes that.
-- **Minimum cross separation** (`MIN_CROSS_SEPARATION_ATR = 0.15`) --
-  the MA5/MA10 gap must exceed this multiple of ATR, not just be
-  positive. Skips razor-thin crosses.
-- **Confirm bars** (`CROSS_CONFIRM_BARS = 2`) -- the crossed state
-  must hold for 2 consecutive bars before firing, and fires exactly
-  once (not every bar after).
-- **Trend buffer** (`TREND_BUFFER_ATR = 0.25`) -- price must clear the
-  200MA/VWAP by this multiple of ATR before counting as bull/bear,
-  instead of flipping bias every time price grazes the line.
-- **Cooldown** (`SIGNAL_COOLDOWN_BARS = 6`) -- no new signal on the
-  same ticker within 6 bars of the last one, live in both
-  `stock_scanner.py` and `scanner_dashboard.py`.
-
-**Honest caveat, found via testing, not assumed:** stacking several
-independent filters multiplies their individual pass rates together.
-In backtesting against synthetic data, this occasionally reduced a
-ticker's signal count to zero for a given window, even with the
-corrected ADX design. That's an inherent property of filter-stacking,
-not a bug -- but it means you should actually run the backtester
-below against your real watchlist rather than assume the defaults are
-right, and know which knob to loosen first if it's too strict:
-1. Increase `ADX_RISING_LOOKBACK` (gives ADX more time to show it's rising)
-2. Lower `MIN_CROSS_SEPARATION_ATR`
-3. Lower `CROSS_CONFIRM_BARS` to 1 (back toward the original raw-cross behavior)
+An earlier version of this scanner used 5m/15m MA-crossover + MACD/RSI
++ VWAP + a stack of ADX/separation/confirm-bar chop filters. It's
+gone now, replaced by the daily trend-following strategy described at
+the top of this file, because after several rounds of tuning it kept
+producing either too many whipsaws or (once filtered) too few or zero
+signals — a symptom of fighting noise on too short a timeframe rather
+than a fixable parameter problem. If you have an old `paper_trades.json`
+from that version, reset the paper account (sidebar button) before
+trusting the new dashboard's numbers.
 
 ## Backtesting (`backtest.py`)
 
-Replays the exact same trend/trigger/confirmation logic against
-historical data -- no lookahead, causal multi-timeframe alignment --
-and drives it through the same paper-trading engine used by the live
-dashboard, so you get a real trade list instead of eyeballing a few
-days of live signals.
+Replays the exact same trend-filter/breakout/exit logic against
+historical daily data -- via `core.evaluate_bar`, the SAME function
+the live scanner uses, so backtest and live can never quietly drift
+apart -- and drives it through the same paper-trading engine used by
+the live dashboard, so you get a real trade list instead of guessing.
 
 ```
-python backtest.py                  # current filter config, all tickers in WATCHLIST
-python backtest.py --ticker BTC-USD # a single ticker
-python backtest.py --compare        # baseline (unfiltered, old behavior) vs current config, side by side
+python backtest.py                     # current config, all tickers in WATCHLIST
+python backtest.py --ticker BTC-USD    # a single ticker
 ```
 
 Output is a trade count, win rate, total simulated P&L, and a
-breakdown of exit reasons (stop-loss / take-profit / trend-flip /
-reversal) per ticker.
+breakdown of exit reasons (channel-exit / atr-stop / reversal) per
+ticker.
 
 **Limits worth knowing:**
-- yfinance's intraday history is capped at roughly 60 days regardless
-  of what's asked for -- that's a data-source limit, not a setting
-  here.
-- This evaluates the RULES on past data. It is not a live simulation,
-  and it ignores real slippage, fees, latency, and fills. Use it to
-  compare rule sets against each other (baseline vs. filtered, or one
-  filter value vs. another), not to forecast a real-money return.
+- `DAILY_LOOKBACK` (2 years by default, in `stock_scanner.py`) limits
+  how far back this looks — not a hard data-source cap like intraday
+  data has, just a setting you can raise for a longer test.
+- This evaluates the STRATEGY on past data. It is not a live
+  simulation, and it ignores real slippage, fees, latency, and fills.
+- Trend-following backtests are sensitive to which years they cover —
+  a window with no real trends will show few or losing trades. That's
+  expected behavior for this style of strategy, not necessarily a
+  sign something's broken.
 
 ## Next step: execution
 

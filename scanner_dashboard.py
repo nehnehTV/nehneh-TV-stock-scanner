@@ -1,11 +1,11 @@
 """
-Stock Setup Scanner -- Dashboard
-==================================
-A live browser dashboard for the scanner in stock_scanner.py. Same
-setup logic (15m trend filter + 5m MA cross + MACD/RSI confirmation),
-shown as a command-center style UI with each watchlist ticker styled
-as a scanning "agent," plus a paper-trading simulator so the balance
-chart reflects real (simulated) outcomes.
+Stock/Crypto Trend-Following Scanner -- Dashboard
+====================================================
+A live browser dashboard for the daily trend-following strategy in
+stock_scanner.py (200-day trend filter + Donchian breakout entry +
+ATR-based sizing/stops), shown as a command-center style UI with each
+watchlist ticker styled as a scanning "agent," plus a paper-trading
+simulator so the balance chart reflects real (simulated) outcomes.
 
 Run with:
     streamlit run scanner_dashboard.py
@@ -191,7 +191,7 @@ with st.sidebar:
     )
     watchlist = [t.strip().upper() for t in watchlist_text.split(",") if t.strip()]
 
-    poll_seconds = st.slider("Refresh every (seconds)", 15, 300, core.POLL_INTERVAL_SECONDS, step=15)
+    poll_seconds = st.slider("Refresh every (seconds)", 60, 3600, core.POLL_INTERVAL_SECONDS, step=60)
     if core.CRYPTO_MODE:
         st.caption("Crypto mode: trades 24/7, always scanning.")
         force_scan = True
@@ -199,25 +199,21 @@ with st.sidebar:
         force_scan = st.checkbox(
             "Scan even when market is closed",
             value=False,
-            help="For testing outside market hours. Data will look stale/frozen.",
+            help="Daily bars don't change until the close anyway -- this just lets you preview mid-day.",
         )
     desktop_notify = st.checkbox("Desktop notifications", value=True)
 
     st.divider()
     st.subheader("Paper trading")
     st.caption("Simulated only -- no real orders are placed.")
-    new_notional = st.number_input("$ per simulated trade", min_value=100.0,
-                                    value=float(paper_state["settings"]["position_notional"]), step=100.0)
-    new_stop = st.number_input("Stop-loss %", min_value=0.1, max_value=50.0,
-                                value=float(paper_state["settings"]["stop_loss_pct"] * 100), step=0.1) / 100
-    new_take = st.number_input("Take-profit %", min_value=0.1, max_value=100.0,
-                                value=float(paper_state["settings"]["take_profit_pct"] * 100), step=0.1) / 100
-    if (new_notional != paper_state["settings"]["position_notional"] or
-            new_stop != paper_state["settings"]["stop_loss_pct"] or
-            new_take != paper_state["settings"]["take_profit_pct"]):
-        paper_state["settings"]["position_notional"] = new_notional
-        paper_state["settings"]["stop_loss_pct"] = new_stop
-        paper_state["settings"]["take_profit_pct"] = new_take
+    new_risk_pct = st.number_input("Risk per trade (% of equity)", min_value=0.1, max_value=10.0,
+                                    value=float(paper_state["settings"]["risk_per_trade_pct"] * 100), step=0.1) / 100
+    new_atr_mult = st.number_input("ATR stop multiplier", min_value=0.5, max_value=10.0,
+                                    value=float(paper_state["settings"]["atr_stop_multiplier"]), step=0.5)
+    if (new_risk_pct != paper_state["settings"]["risk_per_trade_pct"] or
+            new_atr_mult != paper_state["settings"]["atr_stop_multiplier"]):
+        paper_state["settings"]["risk_per_trade_pct"] = new_risk_pct
+        paper_state["settings"]["atr_stop_multiplier"] = new_atr_mult
         pt.save_state(paper_state)
 
     confirm_reset = st.checkbox("I understand this clears simulated history")
@@ -228,11 +224,11 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Trend: 15m price vs 200 MA & VWAP  \n"
-        "Trigger: 5m MA5/MA10 crossover  \n"
-        "Confirm: MACD + RSI(50) agree with direction"
+        f"Trend: daily close vs {core.TREND_MA_PERIOD}-day MA  \n"
+        f"Entry: {core.ENTRY_BREAKOUT_DAYS}-day Donchian breakout, with-trend only  \n"
+        f"Exit: {core.EXIT_BREAKOUT_DAYS}-day opposite channel OR {core.ATR_STOP_MULTIPLIER}x ATR hard stop"
     )
-    st.caption("Data via yfinance -- typically ~15-20 min delayed.")
+    st.caption("Data via yfinance. For stocks, today's daily bar is provisional until market close.")
     if core.CRYPTO_MODE:
         st.caption("GEX (call resistance/put support) has no data source for crypto -- those two fields will show \"not set\" unless you enter them manually. Leash/River/GEX overrides still work as manual levels.")
 
@@ -258,7 +254,7 @@ with hcol1:
     st.markdown('<div class="hdr-title">SETUP <span>SCANNER</span></div>', unsafe_allow_html=True)
     mode_word = "CRYPTO &middot; 24/7" if core.CRYPTO_MODE else "EQUITIES"
     st.markdown(
-        f'<div class="hdr-subtitle">MULTI-TIMEFRAME SCANNER &middot; {len(watchlist)} AGENTS &middot; {mode_word} &middot; PAPER TRADING</div>',
+        f'<div class="hdr-subtitle">DAILY TREND-FOLLOWING &middot; {len(watchlist)} AGENTS &middot; {mode_word} &middot; PAPER TRADING</div>',
         unsafe_allow_html=True,
     )
 with hcol2:
@@ -316,42 +312,30 @@ def render_levels_editor(ticker: str, levels: dict):
 
 
 def scan_ticker(ticker: str) -> dict:
-    bias = core.get_trend_bias(ticker)
-    direction, bar_ts = (None, None)
-    if bias in ("bull", "bear"):
-        direction, bar_ts = core.get_trigger_signal(ticker)
-
-    df5 = core.fetch(ticker, core.TRIGGER_INTERVAL, core.TRIGGER_LOOKBACK)
-    df5 = core.add_moving_averages(df5, [core.FAST_MA_PERIOD, core.SLOW_MA_PERIOD])
-    df5 = core.add_macd(df5)
-    df5 = core.add_rsi(df5)
-    last5 = df5.iloc[-1]
-    price = last5["Close"]
-
-    confirmed = (direction == "long" and bias == "bull") or (direction == "short" and bias == "bear")
+    result = core.analyze_ticker(ticker)
+    df = core.get_daily_frame(ticker)
 
     pct_change = None
-    try:
-        fast_info = core.yf.Ticker(ticker).fast_info
-        prev_close = fast_info.get("previous_close") or fast_info.get("regularMarketPreviousClose")
-        # guard against NaN as well as None -- yfinance sometimes returns
-        # a NaN float (which is truthy) instead of leaving the field absent
-        if prev_close is not None and pd.notna(prev_close) and prev_close > 0:
+    price = result["price"]
+    if price is not None and len(df) >= 2:
+        prev_close = df["Close"].iloc[-2]
+        if pd.notna(prev_close) and prev_close > 0:
             pct_change = (price - prev_close) / prev_close * 100
-    except Exception:
-        pass
 
     gex = cached_gex(ticker)
     auto_values = {"call_resistance": gex["call_resistance"], "put_support": gex["put_support"]}
     levels = levels_store.get_effective_levels(ticker, auto_values)
 
     return {
-        "bias": bias,
-        "direction": direction if confirmed else None,
-        "bar_ts": bar_ts,
+        "trend": result["trend"],
+        "direction": result["direction"],
+        "bar_ts": result["bar_ts"],
         "price": price,
+        "atr": result["atr"],
+        "exit_high": result["exit_high"],
+        "exit_low": result["exit_low"],
         "pct_change": pct_change,
-        "chart_df": df5[["Close"]].tail(60),
+        "chart_df": df[["Close"]].tail(150),
         "gex": gex,
         "levels": levels,
     }
@@ -365,25 +349,26 @@ def render_agent_card(index: int, ticker: str):
     avatar = avatar_svg(color, shape)
     try:
         data = scan_ticker(ticker)
-        bias = data["bias"]
+        trend = data["trend"]
         direction = data["direction"]
         current_prices[ticker] = data["price"]
 
         is_new_signal = False
         if direction:
-            already = st.session_state.last_signal.get(ticker)
-            is_new_signal = already != (direction, str(data["bar_ts"]))
-            if is_new_signal:
-                st.session_state.last_signal[ticker] = (direction, str(data["bar_ts"]))
+            already = st.session_state.last_signal.get(ticker)  # (direction, bar_ts) or None
+            is_new_bar = already is None or already[1] != data["bar_ts"]
+            if is_new_bar:
+                is_new_signal = True
+                st.session_state.last_signal[ticker] = (direction, data["bar_ts"])
                 stamp = now_et.strftime("%Y-%m-%d %H:%M:%S")
-                msg = f"15m trend={bias}, MA5/MA10 cross, MACD+RSI confirmed"
+                msg = f"trend={trend}, {core.ENTRY_BREAKOUT_DAYS}-day channel broken"
                 st.session_state.activity_log.insert(0, (stamp, ticker, "signal", direction, msg))
                 if desktop_notify:
-                    core.desktop_alert(f"{ticker} {direction.upper()} setup", msg)
+                    core.desktop_alert(f"{ticker} {direction.upper()} breakout", msg)
 
-        paper_action = pt.apply_signal(
-            paper_state, ticker, bias, direction, is_new_signal, data["price"],
-            now_et.strftime("%Y-%m-%d %H:%M:%S"),
+        paper_action = pt.apply_breakout_signal(
+            paper_state, ticker, direction, is_new_signal, data["price"], data["atr"],
+            data["exit_high"], data["exit_low"], now_et.strftime("%Y-%m-%d %H:%M:%S"),
         )
         if paper_action:
             stamp = now_et.strftime("%Y-%m-%d %H:%M:%S")
@@ -398,8 +383,8 @@ def render_agent_card(index: int, ticker: str):
             status_text = f"{direction.upper()} SIGNAL"
         else:
             card_class = ""
-            status_class = {"bull": "bull", "bear": "bear"}.get(bias, "mixed")
-            status_text = f"{bias.upper()} SCAN" if bias in ("bull", "bear") else "STANDBY"
+            status_class = {"bull": "bull", "bear": "bear"}.get(trend, "mixed")
+            status_text = f"{trend.upper()}" if trend in ("bull", "bear") else "STANDBY"
 
         pos = paper_state["positions"].get(ticker)
         position_tag = f'<span class="agent-position-tag">IN {pos["direction"].upper()}</span>' if pos else ""
@@ -428,10 +413,11 @@ def render_agent_card(index: int, ticker: str):
         st.line_chart(data["chart_df"]["Close"], height=110, color=chart_color)
 
         action_html = f'<div class="agent-action">PAPER: {paper_action}</div>' if paper_action else ""
+        atr_html = f'ATR <b>{data["atr"]:,.4f}</b>' if data["atr"] is not None else ""
         footer_html = (
             '<div class="agent-card" style="margin-top:-14px;border-top:none;border-top-left-radius:0;border-top-right-radius:0;">'
             f'<div class="agent-footer"><span class="agent-status {status_class}">{status_text}</span>{pct_html}</div>'
-            f'<div class="agent-meta">Price <b>${data["price"]:,.2f}</b></div>'
+            f'<div class="agent-meta">Price <b>${data["price"]:,.4f}</b> &nbsp;|&nbsp; {atr_html}</div>'
             f'{action_html}</div>'
         )
         st.markdown(footer_html, unsafe_allow_html=True)

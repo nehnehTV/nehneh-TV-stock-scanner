@@ -1,35 +1,42 @@
 """
-Stock Setup Scanner
-====================
-Watches a list of tickers during market hours and flags when they meet a
-multi-timeframe long/short setup:
+Stock/Crypto Trend-Following Scanner
+======================================
+Daily-bar Donchian breakout system with a 200-day trend filter and
+ATR-based position sizing/stops -- a simplified version of the classic
+Turtle Trading approach. Replaces an earlier 5m/15m MA-crossover setup
+that whipsawed badly in chop; this is built around fewer rules and a
+higher timeframe on purpose (see the reasoning in README.md).
 
-  TREND FILTER (15-minute chart)
-    - Price above 200 MA AND above VWAP  -> bullish regime
-    - Price below 200 MA AND below VWAP  -> bearish regime
-    - Anything mixed                     -> no trade, sit out
+  TREND FILTER (daily chart)
+    - Close above 200-day MA -> bull regime (only take longs)
+    - Close below 200-day MA -> bear regime (only take shorts)
 
-  TRIGGER (5-minute chart)
-    - 5 MA crosses above 10 MA -> long trigger
-    - 5 MA crosses below 10 MA -> short trigger
+  ENTRY (Donchian breakout)
+    - Close breaks above the highest high of the last ENTRY_BREAKOUT_DAYS
+      days, AND regime is bull -> long
+    - Close breaks below the lowest low of the last ENTRY_BREAKOUT_DAYS
+      days, AND regime is bear -> short
 
-  CONFIRMATION (5-minute chart)
-    - MACD line above/below its signal line, matching direction
-    - RSI(14) above/below 50, matching direction
+  POSITION SIZING (volatility-adjusted, not a fixed dollar amount)
+    - shares = (equity x RISK_PER_TRADE_PCT) / (ATR_STOP_MULTIPLIER x ATR)
+    - so a stop-out loses roughly RISK_PER_TRADE_PCT of equity
+      regardless of how volatile the instrument is
 
-A signal only fires when ALL THREE agree. Each (ticker, direction, bar)
-only fires once, so you don't get spammed every poll.
+  EXIT (two independent exits, whichever triggers first)
+    - Channel exit: close breaks the OPPOSITE side of the shorter
+      EXIT_BREAKOUT_DAYS channel (lets winners run with the trend)
+    - ATR hard stop: price moves ATR_STOP_MULTIPLIER x ATR against
+      entry (caps worst-case loss on any single trade)
 
-This is a SCANNER ONLY. It does not place trades. Data comes from
-yfinance, which is free but typically ~15-20 minutes delayed, and not
-suitable for a live order-execution engine -- treat every alert as
-something to verify on your own broker/chart before acting.
+This is a SCANNER (plus a paper-trading simulator). It does not place
+real trades. Data comes from yfinance. For stocks, a daily bar is
+provisional until market close -- checking mid-day shows where things
+stand right now, not a final signal.
 
 Run it with:  python stock_scanner.py
 Stop it with: Ctrl+C
 """
 
-import math
 import time
 import sys
 import traceback
@@ -37,6 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
+import math
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -51,7 +59,7 @@ except Exception:
 
 
 # ============================================================
-# CONFIG -- edit this section to tune the scanner
+# CONFIG -- edit this section to tune the strategy
 # ============================================================
 
 # Set True for crypto (24/7, no market-hours gate) or False for stocks.
@@ -60,41 +68,29 @@ CRYPTO_MODE = True
 
 WATCHLIST = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD"] if CRYPTO_MODE else \
             ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"]
+# NOTE on diversification: a real edge in trend-following comes partly
+# from spreading risk across UNCORRELATED instruments. Most crypto
+# alts move with BTC most of the time, so this crypto watchlist is
+# less diversified than it looks -- worth knowing, not something the
+# code can fix for you.
 
-# How often to re-check the whole watchlist, in seconds.
-# 5-min/15-min bars don't update faster than the underlying candle anyway,
-# but polling every 60s means you catch a new bar close quickly.
-POLL_INTERVAL_SECONDS = 60
+# Daily bars only now -- no separate trend/trigger timeframes needed.
+DAILY_INTERVAL = "1d"
+DAILY_LOOKBACK = "2y"   # yfinance's daily history isn't capped like intraday is
 
-# Trend filter timeframe/lookback
-TREND_INTERVAL = "15m"
-TREND_LOOKBACK = "60d"     # yfinance max history for 15m bars
-TREND_MA_PERIOD = 200
+# How often to re-check the watchlist, in seconds. Daily bars don't
+# change until the next day's close, so polling every 60s mostly just
+# re-confirms the same still-forming "today" bar -- an hourly check is
+# plenty for stocks; for crypto (24/7, no clean daily close) more
+# frequent checks are reasonable if you want to react sooner.
+POLL_INTERVAL_SECONDS = 3600
 
-# Trigger/confirmation timeframe/lookback
-TRIGGER_INTERVAL = "5m"
-TRIGGER_LOOKBACK = "5d"    # plenty of 5m bars for MA10/MACD/RSI warmup
-FAST_MA_PERIOD = 5
-SLOW_MA_PERIOD = 10
-
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-RSI_PERIOD = 14
-RSI_MIDLINE = 50  # RSI above this = bullish tilt, below = bearish tilt
-
-# --- Chop filters -------------------------------------------------
-# These exist because fast MA crossovers whipsaw constantly in sideways
-# markets. Each one independently makes the scanner pickier; together
-# they should cut false signals substantially. Use backtest.py to check
-# that empirically rather than trusting this comment.
-ADX_PERIOD = 14
-ADX_FLOOR = 8                 # skip signals when trend strength is near-zero (dead flat)
-ADX_RISING_LOOKBACK = 5       # ADX must be higher than it was this many bars ago (trend strength building)
-MIN_CROSS_SEPARATION_ATR = 0.15  # MA5/MA10 gap must exceed this multiple of ATR
-CROSS_CONFIRM_BARS = 2        # the MA5/MA10 relationship must hold this many bars before firing
-TREND_BUFFER_ATR = 0.25       # price must clear the 200MA/VWAP by this multiple of ATR to count
-SIGNAL_COOLDOWN_BARS = 6      # no new signal on the same ticker within this many 5m bars of the last
+TREND_MA_PERIOD = 200        # 200-day MA: long/short regime filter
+ENTRY_BREAKOUT_DAYS = 20     # N-day high/low breakout triggers entry
+EXIT_BREAKOUT_DAYS = 10      # shorter channel triggers exit (lets winners run)
+ATR_PERIOD = 20              # "N" in Turtle-system terms
+ATR_STOP_MULTIPLIER = 2.0    # hard stop = this many ATRs from entry
+RISK_PER_TRADE_PCT = 0.01    # risk ~1% of equity per trade; position size scales with this
 
 MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = dtime(9, 30)
@@ -107,46 +103,18 @@ LOG_FILE_PREFIX = "scanner_log"
 # Indicator math
 # ============================================================
 
-def add_atr_adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> pd.DataFrame:
-    """Wilder's ATR and ADX. ADX measures trend STRENGTH (0-100,
-    regardless of direction) -- low ADX means the market is choppy/flat,
-    which is exactly the condition that causes MA-crossover whipsaws."""
+def add_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.DataFrame:
+    """Wilder's ATR -- average true range, used for both position
+    sizing (bigger ATR = smaller position) and the hard stop distance."""
     df = df.copy()
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
-
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
-    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
-
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
-    di_sum = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / di_sum
-    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
-
-    df["ATR"] = atr
-    df["ADX"] = adx
-    return df
-
-
-def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
-    """Session VWAP, resetting each calendar day."""
-    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
-    df = df.copy()
-    df["_date"] = df.index.date
-    df["_tpv"] = typical_price * df["Volume"]
-    df["cum_tpv"] = df.groupby("_date")["_tpv"].cumsum()
-    df["cum_vol"] = df.groupby("_date")["Volume"].cumsum()
-    df["VWAP"] = df["cum_tpv"] / df["cum_vol"]
+    df["ATR"] = tr.ewm(alpha=1 / period, adjust=False).mean()
     return df
 
 
@@ -157,26 +125,16 @@ def add_moving_averages(df: pd.DataFrame, periods) -> pd.DataFrame:
     return df
 
 
-def add_macd(df: pd.DataFrame, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL) -> pd.DataFrame:
+def add_donchian_channels(df: pd.DataFrame, entry_days: int = ENTRY_BREAKOUT_DAYS,
+                           exit_days: int = EXIT_BREAKOUT_DAYS) -> pd.DataFrame:
+    """Rolling N-day high/low channels. shift(1) excludes today's own
+    bar from its own channel -- otherwise a big move today would trivially
+    'break out' of a level that includes today, which is meaningless."""
     df = df.copy()
-    ema_fast = df["Close"].ewm(span=fast, adjust=False).mean()
-    ema_slow = df["Close"].ewm(span=slow, adjust=False).mean()
-    df["MACD"] = ema_fast - ema_slow
-    df["MACD_signal"] = df["MACD"].ewm(span=signal, adjust=False).mean()
-    df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
-    return df
-
-
-def add_rsi(df: pd.DataFrame, period=RSI_PERIOD) -> pd.DataFrame:
-    df = df.copy()
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["RSI"] = df["RSI"].fillna(100)  # no losses at all -> maxed out RSI
+    df["entry_high"] = df["High"].shift(1).rolling(entry_days).max()
+    df["entry_low"] = df["Low"].shift(1).rolling(entry_days).min()
+    df["exit_high"] = df["High"].shift(1).rolling(exit_days).max()
+    df["exit_low"] = df["Low"].shift(1).rolling(exit_days).min()
     return df
 
 
@@ -188,9 +146,74 @@ def fetch(ticker: str, interval: str, period: str) -> pd.DataFrame:
     df = yf.Ticker(ticker).history(period=period, interval=interval)
     if df.empty:
         raise ValueError(f"No data returned for {ticker} ({interval})")
-    # yfinance intraday index is already tz-aware in exchange local time
     return df
 
+
+def get_daily_frame(ticker: str) -> pd.DataFrame:
+    """The one fetch/compute per ticker -- everything else derives from
+    this. Reused as-is by backtest.py so live and backtest logic can
+    never drift apart."""
+    df = fetch(ticker, DAILY_INTERVAL, DAILY_LOOKBACK)
+    df = add_moving_averages(df, [TREND_MA_PERIOD])
+    df = add_atr(df, ATR_PERIOD)
+    df = add_donchian_channels(df, ENTRY_BREAKOUT_DAYS, EXIT_BREAKOUT_DAYS)
+    return df
+
+
+def evaluate_bar(row) -> dict:
+    """Pure function: given one row of a daily frame (MA/ATR/Donchian
+    columns already computed), returns the trend regime + breakout
+    decision for that bar. Used by both analyze_ticker (live) and
+    backtest.py (historical replay) -- kept as one function so the two
+    can never disagree with each other."""
+    ma_col = f"MA{TREND_MA_PERIOD}"
+    ma = row.get(ma_col)
+    if pd.isna(ma):
+        trend = "insufficient_data"
+    elif row["Close"] > ma:
+        trend = "bull"
+    elif row["Close"] < ma:
+        trend = "bear"
+    else:
+        trend = "neutral"
+
+    direction = None
+    entry_high, entry_low = row.get("entry_high"), row.get("entry_low")
+    if trend == "bull" and pd.notna(entry_high) and row["Close"] > entry_high:
+        direction = "long"
+    elif trend == "bear" and pd.notna(entry_low) and row["Close"] < entry_low:
+        direction = "short"
+
+    return {"trend": trend, "direction": direction}
+
+
+def analyze_ticker(ticker: str) -> dict:
+    """Live analysis for one ticker: trend, breakout direction (if any),
+    current price/ATR/exit-channel levels, and the bar timestamp."""
+    df = get_daily_frame(ticker)
+    min_len = max(TREND_MA_PERIOD, ENTRY_BREAKOUT_DAYS, ATR_PERIOD) + 2
+    if len(df) < min_len:
+        return {"trend": "insufficient_data", "direction": None, "bar_ts": None,
+                "price": None, "atr": None, "exit_high": None, "exit_low": None}
+
+    last = df.iloc[-1]
+    decision = evaluate_bar(last)
+    return {
+        "trend": decision["trend"],
+        "direction": decision["direction"],
+        "bar_ts": last.name,
+        "price": last["Close"],
+        "atr": last["ATR"],
+        "exit_high": last["exit_high"],
+        "exit_low": last["exit_low"],
+    }
+
+
+# ============================================================
+# GEX / manual levels (independent of the trading strategy above --
+# these are informational annotations you enter or that get a rough
+# free-data estimate, not inputs to the entry/exit rules)
+# ============================================================
 
 def _bs_gamma(spot: float, strike: float, years_to_expiry: float, iv: float, r: float = 0.05) -> float:
     """Black-Scholes gamma. yfinance's option chain gives IV/open interest
@@ -276,120 +299,6 @@ def get_effective_levels(ticker: str) -> dict:
     return levels_store.get_effective_levels(ticker, auto_values)
 
 
-def get_trend_bias(ticker: str) -> str:
-    """Returns 'bull', 'bear', or 'mixed' based on the 15m chart.
-
-    Uses an ATR buffer around the 200MA/VWAP so bias doesn't flicker
-    when price is sitting right on the line -- without it, a market
-    chopping around that level flips bull/bear/mixed every bar.
-    """
-    df = fetch(ticker, TREND_INTERVAL, TREND_LOOKBACK)
-    df = add_moving_averages(df, [TREND_MA_PERIOD])
-    df = add_vwap(df)
-    df = add_atr_adx(df, ADX_PERIOD)
-    last = df.iloc[-1]
-
-    if pd.isna(last[f"MA{TREND_MA_PERIOD}"]) or pd.isna(last["ATR"]):
-        return "insufficient_data"
-
-    price = last["Close"]
-    buffer = TREND_BUFFER_ATR * last["ATR"]
-    above_ma = price > last[f"MA{TREND_MA_PERIOD}"] + buffer
-    below_ma = price < last[f"MA{TREND_MA_PERIOD}"] - buffer
-    above_vwap = price > last["VWAP"] + buffer
-    below_vwap = price < last["VWAP"] - buffer
-
-    if above_ma and above_vwap:
-        return "bull"
-    if below_ma and below_vwap:
-        return "bear"
-    return "mixed"
-
-
-def get_trigger_signal(ticker: str):
-    """
-    Checks the 5m chart for a confirmed MA5/MA10 crossover, filtered
-    against chop:
-      - ADX must be above ADX_FLOOR (excludes dead-flat/near-zero
-        trend strength) AND rising vs ADX_RISING_LOOKBACK bars ago
-        (trend strength must be building). NOTE: a static high ADX
-        threshold checked at the exact cross bar was tested and
-        rejected -- ADX is a lagging/smoothed indicator, so it hasn't
-        caught up yet right when a fresh cross happens, and requiring
-        both at once eliminated ~95% of otherwise-valid signals in
-        backtesting. This floor+rising design is the result of that.
-      - the MA5/MA10 gap must exceed MIN_CROSS_SEPARATION_ATR x ATR
-        (skip razor-thin crosses)
-      - the relationship must hold for CROSS_CONFIRM_BARS bars, and
-        fires exactly once, on the bar where that hold is first met
-        (skip 1-bar flickers)
-    ...then confirmed by MACD + RSI direction, same as before.
-    Returns (direction, bar_timestamp) or (None, None).
-    """
-    df = fetch(ticker, TRIGGER_INTERVAL, TRIGGER_LOOKBACK)
-    df = add_moving_averages(df, [FAST_MA_PERIOD, SLOW_MA_PERIOD])
-    df = add_macd(df)
-    df = add_rsi(df)
-    df = add_atr_adx(df, ADX_PERIOD)
-
-    min_len = SLOW_MA_PERIOD + CROSS_CONFIRM_BARS + ADX_RISING_LOOKBACK + 2
-    if len(df) < min_len:
-        return None, None
-
-    fast_col, slow_col = f"MA{FAST_MA_PERIOD}", f"MA{SLOW_MA_PERIOD}"
-    window = df.iloc[-(CROSS_CONFIRM_BARS + 1):]
-    if window[[fast_col, slow_col, "ATR", "ADX"]].isna().any().any():
-        return None, None
-
-    last = df.iloc[-1]
-
-    # Confirm-bars check: the fast/slow relationship must hold for the
-    # last CROSS_CONFIRM_BARS bars, and NOT have held one bar before that
-    # -- i.e. this is the bar where the hold requirement is first met, so
-    # the signal fires exactly once per cross rather than every bar after.
-    hold_window = df[fast_col].iloc[-CROSS_CONFIRM_BARS:] > df[slow_col].iloc[-CROSS_CONFIRM_BARS:]
-    prior_above = df[fast_col].iloc[-(CROSS_CONFIRM_BARS + 1)] > df[slow_col].iloc[-(CROSS_CONFIRM_BARS + 1)]
-    hold_window_down = df[fast_col].iloc[-CROSS_CONFIRM_BARS:] < df[slow_col].iloc[-CROSS_CONFIRM_BARS:]
-    prior_below = df[fast_col].iloc[-(CROSS_CONFIRM_BARS + 1)] < df[slow_col].iloc[-(CROSS_CONFIRM_BARS + 1)]
-
-    confirmed_up = hold_window.all() and not prior_above
-    confirmed_down = hold_window_down.all() and not prior_below
-
-    if not (confirmed_up or confirmed_down):
-        return None, None
-
-    # Chop filters
-    if last["ADX"] < ADX_FLOOR:
-        return None, None
-    adx_prior = df["ADX"].iloc[-(ADX_RISING_LOOKBACK + 1)]
-    if pd.isna(adx_prior) or last["ADX"] <= adx_prior:
-        return None, None  # trend strength isn't building
-    separation = abs(last[fast_col] - last[slow_col])
-    if separation < MIN_CROSS_SEPARATION_ATR * last["ATR"]:
-        return None, None
-
-    macd_bullish = last["MACD"] > last["MACD_signal"]
-    macd_bearish = last["MACD"] < last["MACD_signal"]
-    rsi_bullish = last["RSI"] > RSI_MIDLINE
-    rsi_bearish = last["RSI"] < RSI_MIDLINE
-
-    if confirmed_up and macd_bullish and rsi_bullish:
-        return "long", last.name
-    if confirmed_down and macd_bearish and rsi_bearish:
-        return "short", last.name
-
-    return None, None
-
-
-def cooldown_active(last_fired_ts, current_ts, bar_minutes: int = 5, cooldown_bars: int = SIGNAL_COOLDOWN_BARS) -> bool:
-    """True if current_ts is too soon after last_fired_ts to count as a
-    fresh signal -- stops an immediate whipsaw from re-firing right away."""
-    if last_fired_ts is None:
-        return False
-    elapsed_minutes = (current_ts - last_fired_ts).total_seconds() / 60
-    return elapsed_minutes < bar_minutes * cooldown_bars
-
-
 # ============================================================
 # Market hours check
 # ============================================================
@@ -438,30 +347,20 @@ class ScannerState:
 def scan_once(state: ScannerState):
     for ticker in WATCHLIST:
         try:
-            bias = get_trend_bias(ticker)
-            if bias not in ("bull", "bear"):
-                continue  # mixed regime or not enough data -> sit out
-
-            direction, bar_ts = get_trigger_signal(ticker)
+            result = analyze_ticker(ticker)
+            direction, bar_ts = result["direction"], result["bar_ts"]
             if direction is None:
                 continue
 
-            # Trigger must agree with the higher-timeframe bias
-            if (direction == "long" and bias != "bull") or (direction == "short" and bias != "bear"):
-                continue
-
-            key = ticker
-            already_fired = state.last_signal.get(key)  # (direction, bar_ts) or None
+            already_fired = state.last_signal.get(ticker)  # (direction, bar_ts) or None
             if already_fired is not None and already_fired[1] == bar_ts:
                 continue  # already alerted on this exact bar
-            if cooldown_active(already_fired[1] if already_fired else None, bar_ts):
-                continue  # too soon after the last signal -- likely a whipsaw
 
-            state.last_signal[key] = (direction, bar_ts)
+            state.last_signal[ticker] = (direction, bar_ts)
             msg = (
-                f"{ticker}: {direction.upper()} setup -- "
-                f"15m trend={bias}, MA5/MA10 cross, MACD+RSI confirmed "
-                f"(bar {bar_ts})"
+                f"{ticker}: {direction.upper()} breakout -- "
+                f"trend={result['trend']}, {ENTRY_BREAKOUT_DAYS}-day channel broken "
+                f"(bar {bar_ts}, price {result['price']:.4f}, ATR {result['atr']:.4f})"
             )
 
             levels = get_effective_levels(ticker)
@@ -474,7 +373,7 @@ def scan_once(state: ScannerState):
                 msg += " | Levels: " + ", ".join(level_bits)
 
             log_line("SIGNAL: " + msg)
-            desktop_alert(f"{ticker} {direction.upper()} setup", msg)
+            desktop_alert(f"{ticker} {direction.upper()} breakout", msg)
 
         except Exception as e:
             log_line(f"ERROR scanning {ticker}: {e}")
@@ -482,6 +381,8 @@ def scan_once(state: ScannerState):
 
 def main():
     log_line(f"Scanner starting. Watchlist: {', '.join(WATCHLIST)}")
+    log_line(f"Strategy: {ENTRY_BREAKOUT_DAYS}-day Donchian breakout, "
+              f"{TREND_MA_PERIOD}-day trend filter, ATR-sized positions.")
     if not DESKTOP_NOTIFICATIONS_AVAILABLE:
         log_line("Note: desktop notifications unavailable (plyer not installed) -- "
                  "signals will still print/log.")
