@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -82,6 +83,19 @@ MACD_SIGNAL = 9
 RSI_PERIOD = 14
 RSI_MIDLINE = 50  # RSI above this = bullish tilt, below = bearish tilt
 
+# --- Chop filters -------------------------------------------------
+# These exist because fast MA crossovers whipsaw constantly in sideways
+# markets. Each one independently makes the scanner pickier; together
+# they should cut false signals substantially. Use backtest.py to check
+# that empirically rather than trusting this comment.
+ADX_PERIOD = 14
+ADX_FLOOR = 8                 # skip signals when trend strength is near-zero (dead flat)
+ADX_RISING_LOOKBACK = 5       # ADX must be higher than it was this many bars ago (trend strength building)
+MIN_CROSS_SEPARATION_ATR = 0.15  # MA5/MA10 gap must exceed this multiple of ATR
+CROSS_CONFIRM_BARS = 2        # the MA5/MA10 relationship must hold this many bars before firing
+TREND_BUFFER_ATR = 0.25       # price must clear the 200MA/VWAP by this multiple of ATR to count
+SIGNAL_COOLDOWN_BARS = 6      # no new signal on the same ticker within this many 5m bars of the last
+
 MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
@@ -92,6 +106,37 @@ LOG_FILE_PREFIX = "scanner_log"
 # ============================================================
 # Indicator math
 # ============================================================
+
+def add_atr_adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> pd.DataFrame:
+    """Wilder's ATR and ADX. ADX measures trend STRENGTH (0-100,
+    regardless of direction) -- low ADX means the market is choppy/flat,
+    which is exactly the condition that causes MA-crossover whipsaws."""
+    df = df.copy()
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
+    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
+
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+    df["ATR"] = atr
+    df["ADX"] = adx
+    return df
+
 
 def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
     """Session VWAP, resetting each calendar day."""
@@ -129,7 +174,7 @@ def add_rsi(df: pd.DataFrame, period=RSI_PERIOD) -> pd.DataFrame:
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
     df["RSI"] = df["RSI"].fillna(100)  # no losses at all -> maxed out RSI
     return df
@@ -232,61 +277,117 @@ def get_effective_levels(ticker: str) -> dict:
 
 
 def get_trend_bias(ticker: str) -> str:
-    """Returns 'bull', 'bear', or 'mixed' based on the 15m chart."""
+    """Returns 'bull', 'bear', or 'mixed' based on the 15m chart.
+
+    Uses an ATR buffer around the 200MA/VWAP so bias doesn't flicker
+    when price is sitting right on the line -- without it, a market
+    chopping around that level flips bull/bear/mixed every bar.
+    """
     df = fetch(ticker, TREND_INTERVAL, TREND_LOOKBACK)
     df = add_moving_averages(df, [TREND_MA_PERIOD])
     df = add_vwap(df)
+    df = add_atr_adx(df, ADX_PERIOD)
     last = df.iloc[-1]
 
-    if pd.isna(last[f"MA{TREND_MA_PERIOD}"]):
+    if pd.isna(last[f"MA{TREND_MA_PERIOD}"]) or pd.isna(last["ATR"]):
         return "insufficient_data"
 
     price = last["Close"]
-    above_ma = price > last[f"MA{TREND_MA_PERIOD}"]
-    above_vwap = price > last["VWAP"]
+    buffer = TREND_BUFFER_ATR * last["ATR"]
+    above_ma = price > last[f"MA{TREND_MA_PERIOD}"] + buffer
+    below_ma = price < last[f"MA{TREND_MA_PERIOD}"] - buffer
+    above_vwap = price > last["VWAP"] + buffer
+    below_vwap = price < last["VWAP"] - buffer
 
     if above_ma and above_vwap:
         return "bull"
-    if not above_ma and not above_vwap:
+    if below_ma and below_vwap:
         return "bear"
     return "mixed"
 
 
 def get_trigger_signal(ticker: str):
     """
-    Checks the 5m chart for a fresh MA5/MA10 crossover confirmed by
-    MACD + RSI direction. Returns (direction, bar_timestamp) or (None, None).
-    direction is 'long', 'short', or None.
+    Checks the 5m chart for a confirmed MA5/MA10 crossover, filtered
+    against chop:
+      - ADX must be above ADX_FLOOR (excludes dead-flat/near-zero
+        trend strength) AND rising vs ADX_RISING_LOOKBACK bars ago
+        (trend strength must be building). NOTE: a static high ADX
+        threshold checked at the exact cross bar was tested and
+        rejected -- ADX is a lagging/smoothed indicator, so it hasn't
+        caught up yet right when a fresh cross happens, and requiring
+        both at once eliminated ~95% of otherwise-valid signals in
+        backtesting. This floor+rising design is the result of that.
+      - the MA5/MA10 gap must exceed MIN_CROSS_SEPARATION_ATR x ATR
+        (skip razor-thin crosses)
+      - the relationship must hold for CROSS_CONFIRM_BARS bars, and
+        fires exactly once, on the bar where that hold is first met
+        (skip 1-bar flickers)
+    ...then confirmed by MACD + RSI direction, same as before.
+    Returns (direction, bar_timestamp) or (None, None).
     """
     df = fetch(ticker, TRIGGER_INTERVAL, TRIGGER_LOOKBACK)
     df = add_moving_averages(df, [FAST_MA_PERIOD, SLOW_MA_PERIOD])
     df = add_macd(df)
     df = add_rsi(df)
+    df = add_atr_adx(df, ADX_PERIOD)
 
-    if len(df) < SLOW_MA_PERIOD + 2:
+    min_len = SLOW_MA_PERIOD + CROSS_CONFIRM_BARS + ADX_RISING_LOOKBACK + 2
+    if len(df) < min_len:
         return None, None
-
-    prev = df.iloc[-2]
-    last = df.iloc[-1]
 
     fast_col, slow_col = f"MA{FAST_MA_PERIOD}", f"MA{SLOW_MA_PERIOD}"
-    if pd.isna(prev[fast_col]) or pd.isna(prev[slow_col]):
+    window = df.iloc[-(CROSS_CONFIRM_BARS + 1):]
+    if window[[fast_col, slow_col, "ATR", "ADX"]].isna().any().any():
         return None, None
 
-    crossed_up = prev[fast_col] <= prev[slow_col] and last[fast_col] > last[slow_col]
-    crossed_down = prev[fast_col] >= prev[slow_col] and last[fast_col] < last[slow_col]
+    last = df.iloc[-1]
+
+    # Confirm-bars check: the fast/slow relationship must hold for the
+    # last CROSS_CONFIRM_BARS bars, and NOT have held one bar before that
+    # -- i.e. this is the bar where the hold requirement is first met, so
+    # the signal fires exactly once per cross rather than every bar after.
+    hold_window = df[fast_col].iloc[-CROSS_CONFIRM_BARS:] > df[slow_col].iloc[-CROSS_CONFIRM_BARS:]
+    prior_above = df[fast_col].iloc[-(CROSS_CONFIRM_BARS + 1)] > df[slow_col].iloc[-(CROSS_CONFIRM_BARS + 1)]
+    hold_window_down = df[fast_col].iloc[-CROSS_CONFIRM_BARS:] < df[slow_col].iloc[-CROSS_CONFIRM_BARS:]
+    prior_below = df[fast_col].iloc[-(CROSS_CONFIRM_BARS + 1)] < df[slow_col].iloc[-(CROSS_CONFIRM_BARS + 1)]
+
+    confirmed_up = hold_window.all() and not prior_above
+    confirmed_down = hold_window_down.all() and not prior_below
+
+    if not (confirmed_up or confirmed_down):
+        return None, None
+
+    # Chop filters
+    if last["ADX"] < ADX_FLOOR:
+        return None, None
+    adx_prior = df["ADX"].iloc[-(ADX_RISING_LOOKBACK + 1)]
+    if pd.isna(adx_prior) or last["ADX"] <= adx_prior:
+        return None, None  # trend strength isn't building
+    separation = abs(last[fast_col] - last[slow_col])
+    if separation < MIN_CROSS_SEPARATION_ATR * last["ATR"]:
+        return None, None
 
     macd_bullish = last["MACD"] > last["MACD_signal"]
     macd_bearish = last["MACD"] < last["MACD_signal"]
     rsi_bullish = last["RSI"] > RSI_MIDLINE
     rsi_bearish = last["RSI"] < RSI_MIDLINE
 
-    if crossed_up and macd_bullish and rsi_bullish:
+    if confirmed_up and macd_bullish and rsi_bullish:
         return "long", last.name
-    if crossed_down and macd_bearish and rsi_bearish:
+    if confirmed_down and macd_bearish and rsi_bearish:
         return "short", last.name
 
     return None, None
+
+
+def cooldown_active(last_fired_ts, current_ts, bar_minutes: int = 5, cooldown_bars: int = SIGNAL_COOLDOWN_BARS) -> bool:
+    """True if current_ts is too soon after last_fired_ts to count as a
+    fresh signal -- stops an immediate whipsaw from re-firing right away."""
+    if last_fired_ts is None:
+        return False
+    elapsed_minutes = (current_ts - last_fired_ts).total_seconds() / 60
+    return elapsed_minutes < bar_minutes * cooldown_bars
 
 
 # ============================================================
@@ -350,9 +451,11 @@ def scan_once(state: ScannerState):
                 continue
 
             key = ticker
-            already_fired = state.last_signal.get(key)
-            if already_fired == (direction, bar_ts):
+            already_fired = state.last_signal.get(key)  # (direction, bar_ts) or None
+            if already_fired is not None and already_fired[1] == bar_ts:
                 continue  # already alerted on this exact bar
+            if cooldown_active(already_fired[1] if already_fired else None, bar_ts):
+                continue  # too soon after the last signal -- likely a whipsaw
 
             state.last_signal[key] = (direction, bar_ts)
             msg = (

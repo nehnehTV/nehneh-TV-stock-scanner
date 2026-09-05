@@ -59,6 +59,16 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
+def new_state(starting_balance: float = None) -> dict:
+    """In-memory state, never touches disk -- for backtesting so a
+    backtest run never clobbers your live paper-trading account."""
+    state = _default_state()
+    if starting_balance is not None:
+        state["cash"] = starting_balance
+        state["settings"]["starting_balance"] = starting_balance
+    return state
+
+
 def reset_state(starting_balance: float = None):
     fresh = _default_state()
     if starting_balance is not None:
@@ -157,14 +167,18 @@ def apply_signal(state: dict, ticker: str, bias: str, direction, is_new_signal: 
     return " then ".join(action_msgs) if action_msgs else None
 
 
-def mark_to_market(state: dict, current_prices: dict, timestamp: str) -> float:
-    """Appends an equity snapshot (cash + unrealized P&L) and returns it."""
+def mark_to_market(state: dict, current_prices: dict, timestamp: str, cap: int = 500) -> float:
+    """Appends an equity snapshot (cash + unrealized P&L) and returns it.
+    cap limits how much history is kept (live dashboard doesn't need
+    thousands of points); pass cap=None for a backtest, where you want
+    the full curve."""
     equity = state["cash"]
     for ticker, pos in state["positions"].items():
         if ticker in current_prices:
             equity += _position_pnl(pos, current_prices[ticker])
     state["equity_curve"].append([timestamp, round(equity, 2)])
-    state["equity_curve"] = state["equity_curve"][-500:]
+    if cap:
+        state["equity_curve"] = state["equity_curve"][-cap:]
     return equity
 
 
