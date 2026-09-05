@@ -53,7 +53,12 @@ except Exception:
 # CONFIG -- edit this section to tune the scanner
 # ============================================================
 
-WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"]
+# Set True for crypto (24/7, no market-hours gate) or False for stocks.
+# Crypto tickers use yfinance's format: "<SYMBOL>-USD", e.g. "BTC-USD".
+CRYPTO_MODE = True
+
+WATCHLIST = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD"] if CRYPTO_MODE else \
+            ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"]
 
 # How often to re-check the whole watchlist, in seconds.
 # 5-min/15-min bars don't update faster than the underlying candle anyway,
@@ -289,6 +294,8 @@ def get_trigger_signal(ticker: str):
 # ============================================================
 
 def is_market_hours(now=None) -> bool:
+    if CRYPTO_MODE:
+        return True  # crypto trades 24/7 -- no session gate
     now = now or datetime.now(MARKET_TZ)
     if now.weekday() >= 5:  # Sat/Sun
         return False

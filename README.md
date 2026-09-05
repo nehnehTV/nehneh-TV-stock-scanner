@@ -87,6 +87,31 @@ Note: while the dashboard tab is open, it auto-refreshes on its own
 timer, so you don't need the terminal version running at the same time
 unless you specifically want the plain log file too.
 
+## Crypto mode
+
+The scanner defaults to crypto now (`CRYPTO_MODE = True` at the top of
+`stock_scanner.py`). What changes:
+
+- **Watchlist** defaults to `BTC-USD`, `ETH-USD`, `SOL-USD`, `XRP-USD`,
+  `DOGE-USD` — yfinance's crypto ticker format is `<SYMBOL>-USD`.
+- **24/7 scanning** — the market-hours gate is bypassed entirely, so it
+  scans around the clock, weekends included. The "market closed"
+  banner and the "scan even when closed" checkbox go away in crypto
+  mode since they don't apply.
+- **GEX (call resistance / put support) has no data source for
+  crypto** — that feature is built from options-chain data, which
+  yfinance doesn't provide for crypto pairs. Those two fields will
+  just show "not set" unless you type in a manual value yourself.
+  Leash Top/Bottom and River are unaffected — they were always manual
+  entry only.
+- Everything else — trend filter, MA crossover trigger, MACD/RSI
+  confirmation, paper trading, sparklines, activity log — works
+  exactly the same on crypto pairs.
+
+To switch back to stocks, set `CRYPTO_MODE = False` at the top of
+`stock_scanner.py` (the watchlist default and market-hours behavior
+switch back automatically).
+
 ## Paper trading (simulated balance & P&L)
 
 The dashboard now runs a simulated account alongside the scanner:

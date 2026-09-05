@@ -191,11 +191,15 @@ with st.sidebar:
     watchlist = [t.strip().upper() for t in watchlist_text.split(",") if t.strip()]
 
     poll_seconds = st.slider("Refresh every (seconds)", 15, 300, core.POLL_INTERVAL_SECONDS, step=15)
-    force_scan = st.checkbox(
-        "Scan even when market is closed",
-        value=False,
-        help="For testing outside market hours. Data will look stale/frozen.",
-    )
+    if core.CRYPTO_MODE:
+        st.caption("Crypto mode: trades 24/7, always scanning.")
+        force_scan = True
+    else:
+        force_scan = st.checkbox(
+            "Scan even when market is closed",
+            value=False,
+            help="For testing outside market hours. Data will look stale/frozen.",
+        )
     desktop_notify = st.checkbox("Desktop notifications", value=True)
 
     st.divider()
@@ -228,6 +232,8 @@ with st.sidebar:
         "Confirm: MACD + RSI(50) agree with direction"
     )
     st.caption("Data via yfinance -- typically ~15-20 min delayed.")
+    if core.CRYPTO_MODE:
+        st.caption("GEX (call resistance/put support) has no data source for crypto -- those two fields will show \"not set\" unless you enter them manually. Leash/River/GEX overrides still work as manual levels.")
 
 # ============================================================
 # Auto-refresh (its own counter doubles as our scan "cycle" count)
@@ -249,8 +255,9 @@ uptime_str = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m"
 hcol1, hcol2 = st.columns([3, 2])
 with hcol1:
     st.markdown('<div class="hdr-title">SETUP <span>SCANNER</span></div>', unsafe_allow_html=True)
+    mode_word = "CRYPTO &middot; 24/7" if core.CRYPTO_MODE else "EQUITIES"
     st.markdown(
-        f'<div class="hdr-subtitle">MULTI-TIMEFRAME SCANNER &middot; {len(watchlist)} AGENTS &middot; MODE: PAPER TRADING</div>',
+        f'<div class="hdr-subtitle">MULTI-TIMEFRAME SCANNER &middot; {len(watchlist)} AGENTS &middot; {mode_word} &middot; PAPER TRADING</div>',
         unsafe_allow_html=True,
     )
 with hcol2:
